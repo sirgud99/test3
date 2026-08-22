@@ -1,0 +1,12 @@
+torch>=2.4,<3
+transformers>=5.15,<6
+datasets>=3,<5
+accelerate>=1,<2
+huggingface-hub>=0.26,<1
+wandb>=0.18,<1
+numpy>=1.26,<3
+pandas>=2.2,<4
+matplotlib>=3.8,<4
+spacy>=3.8,<4
+tqdm>=4.66,<5
+https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.8.0/en_core_web_sm-3.8.0-py3-none-any.whl
