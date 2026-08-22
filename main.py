@@ -79,10 +79,20 @@ def parse_args() -> argparse.Namespace:
 
     analysis_options = argparse.ArgumentParser(add_help=False, parents=[profile_options])
     analysis_options.add_argument("--checkpoint", type=Path, default=None)
-    analysis_options.add_argument("--analysis-samples", type=int, default=1_000)
+    analysis_options.add_argument(
+        "--analysis-samples",
+        type=int,
+        default=None,
+        help="Limit transitions for a deliberate test run (default: use all).",
+    )
     analysis_options.add_argument("--analysis-batch-size", type=int, default=8)
     analysis_options.add_argument("--pair-stride", type=int, default=1)
-    analysis_options.add_argument("--koopman-rank", type=int, default=64)
+    analysis_options.add_argument(
+        "--koopman-rank",
+        type=int,
+        default=None,
+        help="Use a reduced POD rank for testing (default: full hidden dimension).",
+    )
     analysis_options.add_argument("--ridge-alpha", type=float, default=1e-3)
     analysis_options.add_argument("--top-utterances", type=int, default=10)
 
@@ -430,8 +440,12 @@ def construct_pairs(args: argparse.Namespace) -> None:
     import torch
     from tqdm.auto import tqdm
 
-    if args.analysis_samples < 1 or args.analysis_batch_size < 1 or args.pair_stride < 1:
-        raise ValueError("Analysis samples, batch size, and pair stride must be positive.")
+    if (
+        (args.analysis_samples is not None and args.analysis_samples < 1)
+        or args.analysis_batch_size < 1
+        or args.pair_stride < 1
+    ):
+        raise ValueError("Any sample limit, batch size, and pair stride must be positive.")
 
     checkpoint = args.checkpoint or ARTIFACTS / args.profile / "final"
     model, tokenizer, dataset = load_assets(args.profile, checkpoint)
@@ -442,10 +456,12 @@ def construct_pairs(args: argparse.Namespace) -> None:
         list(chain.from_iterable(dataset["test"]["input_ids"])), dtype=np.int64
     )
     possible = (len(token_stream) - BLOCK_SIZE - 1) // args.pair_stride + 1
-    sample_count = min(args.analysis_samples, possible)
+    sample_count = (
+        possible if args.analysis_samples is None else min(args.analysis_samples, possible)
+    )
     if sample_count < 1:
         raise RuntimeError("The test split is too short to form a shifted utterance pair.")
-    if sample_count < args.analysis_samples:
+    if args.analysis_samples is not None and sample_count < args.analysis_samples:
         print(f"Using all {sample_count} available pairs instead of {args.analysis_samples}.")
 
     starts = np.arange(sample_count) * args.pair_stride
@@ -725,35 +741,39 @@ def feature_matrix(frame: Any) -> tuple[Any, list[str]]:
     return (matrix - means) / scales, list(values.columns)
 
 
-def fit_koopman(source: Any, target: Any, rank: int, ridge: float) -> dict[str, Any]:
-    """Fit a reduced Koopman matrix by ridge regression on hidden states."""
+def fit_koopman(source: Any, target: Any, rank: int | None, ridge: float) -> dict[str, Any]:
+    """Fit a full-space or explicitly rank-reduced Koopman matrix."""
     import numpy as np
 
     center = source.mean(axis=0)
     source_centered = source - center
     target_centered = target - center
-    _, singular_values, right_vectors = np.linalg.svd(source_centered, full_matrices=False)
-    usable = int(np.sum(singular_values > singular_values[0] * 1e-8))
-    reduced_rank = min(rank, usable, source.shape[0] - 1, source.shape[1])
-    if reduced_rank < 1:
-        raise RuntimeError("Hidden representations have no usable variation.")
-    basis = right_vectors[:reduced_rank].T
-    source_reduced = source_centered @ basis
-    target_reduced = target_centered @ basis
-    scale = source_reduced.std(axis=0)
+    if rank is None:
+        fitted_rank = source.shape[1]
+        basis = np.eye(fitted_rank)
+    else:
+        _, singular_values, right_vectors = np.linalg.svd(source_centered, full_matrices=False)
+        usable = int(np.sum(singular_values > singular_values[0] * 1e-8))
+        fitted_rank = min(rank, usable, source.shape[0] - 1, source.shape[1])
+        if fitted_rank < 1:
+            raise RuntimeError("Hidden representations have no usable variation.")
+        basis = right_vectors[:fitted_rank].T
+    source_coordinates = source_centered @ basis
+    target_coordinates = target_centered @ basis
+    scale = source_coordinates.std(axis=0)
     scale[scale < 1e-8] = 1.0
-    source_reduced /= scale
-    target_reduced /= scale
-    gram = source_reduced.T @ source_reduced + ridge * np.eye(reduced_rank)
-    operator = np.linalg.solve(gram, source_reduced.T @ target_reduced)
-    prediction = source_reduced @ operator
-    residual = np.sum((target_reduced - prediction) ** 2)
-    total = np.sum((target_reduced - target_reduced.mean(axis=0)) ** 2)
+    source_coordinates /= scale
+    target_coordinates /= scale
+    gram = source_coordinates.T @ source_coordinates + ridge * np.eye(fitted_rank)
+    operator = np.linalg.solve(gram, source_coordinates.T @ target_coordinates)
+    prediction = source_coordinates @ operator
+    residual = np.sum((target_coordinates - prediction) ** 2)
+    total = np.sum((target_coordinates - target_coordinates.mean(axis=0)) ** 2)
     eigenvalues, eigenvectors = np.linalg.eig(operator)
     order = np.argsort(np.abs(eigenvalues))[::-1]
     eigenvalues = eigenvalues[order]
     eigenvectors = eigenvectors[:, order]
-    alignments = np.abs(source_reduced @ eigenvectors)
+    alignments = np.abs(source_coordinates @ eigenvectors)
     operator_singular_values = np.linalg.svd(operator, compute_uv=False)
     participation = operator_singular_values.sum() ** 2 / np.sum(operator_singular_values**2)
     stable_rank = np.sum(operator_singular_values**2) / operator_singular_values[0] ** 2
@@ -764,9 +784,9 @@ def fit_koopman(source: Any, target: Any, rank: int, ridge: float) -> dict[str, 
         "scale": scale,
         "eigenvalues": eigenvalues,
         "alignments": alignments,
-        "rank": reduced_rank,
+        "rank": fitted_rank,
         "r2": float(1.0 - residual / total) if total > 0 else float("nan"),
-        "rmse": float(np.sqrt(np.mean((target_reduced - prediction) ** 2))),
+        "rmse": float(np.sqrt(np.mean((target_coordinates - prediction) ** 2))),
         "spectral_radius": float(np.max(np.abs(eigenvalues))),
         "effective_dimension": float(participation),
         "stable_rank": float(stable_rank),
@@ -819,8 +839,14 @@ def koopman(args: argparse.Namespace) -> None:
     import numpy as np
     import pandas as pd
 
-    if args.koopman_rank < 1 or args.ridge_alpha < 0 or args.top_utterances < 1:
-        raise ValueError("Koopman rank and top utterances must be positive; ridge must be nonnegative.")
+    if (
+        (args.koopman_rank is not None and args.koopman_rank < 1)
+        or args.ridge_alpha < 0
+        or args.top_utterances < 1
+    ):
+        raise ValueError(
+            "Any Koopman rank and top utterances must be positive; ridge must be nonnegative."
+        )
     output_dir = ARTIFACTS / args.profile / "analysis"
     feature_path = output_dir / "utterance_features.csv"
     representation_path = output_dir / "representations.npz"
@@ -940,7 +966,11 @@ def koopman(args: argparse.Namespace) -> None:
         "layers": list(LAYERS),
         "targets": ["ground_truth", "predicted"],
         "lifting_function": "final-token hidden representation produced by each learned layer",
-        "fit": "POD-reduced ridge regression Y = X K",
+        "fit": (
+            "full hidden-space ridge regression Y = X K"
+            if args.koopman_rank is None
+            else f"POD-reduced rank-{args.koopman_rank} ridge regression Y = X K"
+        ),
         "effective_dimension": "singular-value participation ratio of K",
     }
     (output_dir / "koopman_metadata.json").write_text(json.dumps(summary, indent=2) + "\n")
