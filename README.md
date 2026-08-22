@@ -72,13 +72,8 @@ Run each stage separately:
 ```bash
 python main.py download --profile full
 python main.py prepare --profile full
-python main.py train --profile full
-```
-
-Or run the entire pipeline:
-
-```bash
-python main.py all --profile full
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  main.py train --profile full
 ```
 
 After training, run the exhaustive cluster analysis without sampling or a rank
@@ -88,13 +83,19 @@ limit:
 python main.py analyze --profile full
 ```
 
-The full profile requires a CUDA GPU with BF16 support. Its defaults are one
-epoch, batch size 16, gradient accumulation 16, learning rate `2e-5`, cosine
-decay, 3% warmup, and full-parameter training. Useful overrides include:
+The full profile requires exactly two CUDA processes and GPUs with BF16
+support. Download and preparation run once; only `train` is launched with
+`torchrun`, which prevents concurrent writes to the shared model and dataset
+directories. Training defaults are one epoch, batch size 32 per GPU, gradient
+accumulation 16, effective global batch size 1,024, learning rate `2e-5`, cosine
+decay, 3% warmup, and full-parameter training. W&B and final-file writes occur
+only on rank zero. Useful overrides include:
 
 ```bash
-python main.py train --profile full --batch-size 8 --gradient-accumulation 32
-python main.py train --profile full --epochs 0.25 --run-name first-quarter-run
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  main.py train --profile full --batch-size 16 --gradient-accumulation 16
+CUDA_VISIBLE_DEVICES=0,1 torchrun --standalone --nproc_per_node=2 \
+  main.py train --profile full --epochs 0.25 --run-name first-quarter-run
 ```
 
 Evaluate an existing final model or a specific checkpoint:

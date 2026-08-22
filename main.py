@@ -9,6 +9,7 @@ import platform
 import shutil
 import sys
 import zipfile
+from contextlib import nullcontext
 from itertools import chain
 from pathlib import Path
 from typing import Any
@@ -256,8 +257,9 @@ def evaluate_model(trainer: Any, dataset: Any, prefix: str) -> dict[str, float]:
     except OverflowError:
         perplexity = float("inf")
     metrics[f"{prefix}_perplexity"] = perplexity
-    trainer.log({f"{prefix}_perplexity": perplexity})
-    trainer.log_metrics(prefix, metrics)
+    if trainer.is_world_process_zero():
+        trainer.log({f"{prefix}_perplexity": perplexity})
+        trainer.log_metrics(prefix, metrics)
     return {name: float(value) for name, value in metrics.items()}
 
 
@@ -270,6 +272,21 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
     profile_name = args.profile
     smoke_run = profile_name == "smoke"
     mps_run = profile_name in ("smoke", "mac")
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    primary = rank == 0
+    if profile_name == "full" and world_size != 2:
+        raise RuntimeError(
+            "Full training requires exactly two processes. Launch it with "
+            "torchrun --standalone --nproc_per_node=2 main.py train --profile full."
+        )
+
+    per_device_batch = args.batch_size if args.batch_size is not None else (
+        1 if smoke_run else 8 if mps_run else 32
+    )
+    accumulation = args.gradient_accumulation if args.gradient_accumulation is not None else (
+        1 if mps_run else 16
+    )
     output_root = ARTIFACTS / profile_name
     checkpoint_dir = output_root / "checkpoints"
     final_dir = output_root / "final"
@@ -277,7 +294,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
 
     os.environ["WANDB_LOG_MODEL"] = "false"
     os.environ["WANDB_MODE"] = "online"
-    if not wandb.login():
+    if primary and not wandb.login():
         raise RuntimeError("W&B login is required before training.")
 
     run_name = args.run_name or f"{profile_name}-{PROFILES[profile_name]['model_id'].split('/')[-1]}"
@@ -288,25 +305,34 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         "block_size": BLOCK_SIZE,
         "stride": BLOCK_SIZE,
         "hardware": platform.platform(),
+        "gpus": world_size,
+        "per_device_batch_size": per_device_batch,
+        "gradient_accumulation": accumulation,
+        "effective_batch_size": per_device_batch * accumulation * world_size,
     }
 
-    with wandb.init(
-        project=args.wandb_project,
-        name=run_name,
-        tags=[profile_name, "full-finetune"],
-        config=run_config,
-    ) as run:
+    run_context = (
+        wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            tags=[profile_name, "full-finetune", f"{world_size}-gpu"],
+            config=run_config,
+        )
+        if primary
+        else nullcontext(None)
+    )
+    with run_context as run:
         model, tokenizer, dataset = load_assets(profile_name)
 
         training_args = TrainingArguments(
             output_dir=str(checkpoint_dir),
             run_name=run_name,
-            report_to=["wandb"],
+            report_to=["wandb"] if primary else [],
             num_train_epochs=args.epochs or 1.0,
             max_steps=args.max_steps if args.max_steps is not None else (10 if smoke_run else -1),
-            per_device_train_batch_size=args.batch_size or (1 if smoke_run else 8 if mps_run else 16),
+            per_device_train_batch_size=per_device_batch,
             per_device_eval_batch_size=4 if smoke_run else 8 if mps_run else 16,
-            gradient_accumulation_steps=args.gradient_accumulation or (1 if mps_run else 16),
+            gradient_accumulation_steps=accumulation,
             learning_rate=args.learning_rate or (5e-5 if mps_run else 2e-5),
             lr_scheduler_type="linear" if mps_run else "cosine",
             warmup_steps=0.0 if smoke_run else 0.03,
@@ -323,6 +349,7 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             logging_steps=1 if smoke_run else 10,
             dataloader_num_workers=0,
             dataloader_pin_memory=not mps_run,
+            ddp_find_unused_parameters=False if not mps_run else None,
             seed=42,
         )
         trainer = Trainer(
@@ -341,7 +368,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
         trainer.train()
         validation = evaluate_model(trainer, dataset["validation"], "validation")
         trainer.save_model(final_dir)
-        tokenizer.save_pretrained(final_dir)
+        if primary:
+            tokenizer.save_pretrained(final_dir)
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
         del trainer, model
         gc.collect()
@@ -367,8 +397,10 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "perplexity_change": fine_tuned["fine_tuned_perplexity"] - baseline["baseline_perplexity"],
             "accuracy_change": fine_tuned["fine_tuned_accuracy"] - baseline["baseline_accuracy"],
         }
-        trainer.log(comparison)
-        run.summary.update(comparison)
+        if trainer.is_world_process_zero():
+            trainer.log(comparison)
+        if run is not None:
+            run.summary.update(comparison)
 
         required = [
             baseline["baseline_loss"],
@@ -387,8 +419,9 @@ def train(args: argparse.Namespace) -> dict[str, Any]:
             "comparison": comparison,
             "checkpoint": str(final_dir),
         }
-        (output_root / "results.json").write_text(json.dumps(results, indent=2) + "\n")
-        print(json.dumps(results, indent=2))
+        if primary:
+            (output_root / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+            print(json.dumps(results, indent=2))
         return results
 
 
@@ -1000,6 +1033,10 @@ def main() -> None:
         raise SystemExit("Python 3.11 or newer is required. See README.md for setup.")
 
     args = parse_args()
+    if args.command == "all" and args.profile == "full":
+        raise SystemExit(
+            "For two-GPU training, run download and prepare once, then launch train with torchrun."
+        )
     if args.command == "download":
         download(args)
     elif args.command == "prepare":
