@@ -81,6 +81,13 @@ Or run the entire pipeline:
 python main.py all --profile full
 ```
 
+After training, run the exhaustive cluster analysis without sampling or a rank
+limit:
+
+```bash
+python main.py analyze --profile full
+```
+
 The full profile requires a CUDA GPU with BF16 support. Its defaults are one
 epoch, batch size 16, gradient accumulation 16, learning rate `2e-5`, cosine
 decay, 3% warmup, and full-parameter training. Useful overrides include:
@@ -119,8 +126,9 @@ Run the complete analysis on the saved Mac checkpoint:
 python main.py analyze --profile mac
 ```
 
-The default uses 1,000 overlapping source windows, rank 64, and ridge penalty
-`1e-3`. For a quick executable check:
+The default uses every valid overlapping source window, the complete hidden
+dimension, and ridge penalty `1e-3`. Nothing is sampled or rank-truncated.
+For a deliberately reduced executable check:
 
 ```bash
 python main.py analyze --profile mac --analysis-samples 32 --koopman-rank 8
@@ -162,12 +170,13 @@ missingness indicators during regression, and are summarized in
 `feature_coverage.json`.
 
 `koopman` fits six matrices: three layers crossed with ground-truth versus
-predicted transitions. For each layer, the source hidden states define a
-rank-limited POD/SVD basis. Ridge regression then estimates `Y = X K` in that
-basis. Every eigenmode's absolute utterance alignment is regressed on the
-standardized feature dataframe. The output includes every coefficient, R²,
-eigenvalue, and the most-aligned utterances—not only selected significant
-results.
+predicted transitions. By default, ridge regression estimates `Y = X K` in the
+complete hidden space, producing six 896 by 896 matrices for Qwen2.5-0.5B.
+Every eigenmode's absolute utterance alignment is regressed on the standardized
+feature dataframe. The output includes every coefficient, R², eigenvalue, and
+the most-aligned utterances—not only selected significant results. A
+rank-limited POD/SVD basis is used only when `--koopman-rank` is explicitly
+provided.
 
 Effective dimension is reported three ways:
 
@@ -190,8 +199,9 @@ Effective dimension is reported three ways:
   to which Koopman regression can be applied.
 - Feature-to-mode regressions are descriptive in-sample ridge regressions. They
   identify associations, not causal effects or inferential significance.
-- Rank 64 is a computationally tractable reduced-order model. Increase
-  `--koopman-rank` only when sample count and hardware justify it.
+- The analysis defaults are exhaustive. `--analysis-samples` and
+  `--koopman-rank` are explicit testing controls and should be omitted for the
+  cluster experiment.
 
 ## W&B and outputs
 
@@ -235,7 +245,8 @@ artifacts/
 - `load_norare()` joins the selected English lexical variables by exact form.
 - `annotate()` builds the utterance-by-feature dataframe with spaCy and NoRaRe.
 - `feature_matrix()` imputes missing ratings and standardizes regression inputs.
-- `fit_koopman()` fits one reduced ridge operator and computes its spectrum.
+- `fit_koopman()` fits one full-space or explicitly reduced ridge operator and
+  computes its spectrum.
 - `plot_koopman()` plots all modes, their alignments, and feature coefficients.
 - `koopman()` creates six operators and regresses every eigenmode on features.
 - `analyze()` runs the full post-training analysis in order.
