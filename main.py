@@ -849,7 +849,8 @@ def largest_singular_value(matrix: Any, device: Any, chunk_size: int = 2_048) ->
     for start in range(0, matrix.shape[0], chunk_size):
         rows = matrix[start : start + chunk_size].to(device=device, dtype=torch.float32)
         gram.addmm_(rows.T, rows)
-    eigenvalues = torch.linalg.eigvalsh(gram.cpu())
+    eigenvalue_input = gram if device.type == "cuda" else gram.cpu()
+    eigenvalues = torch.linalg.eigvalsh(eigenvalue_input)
     return float(eigenvalues[-1].clamp_min(0.0).sqrt())
 
 
