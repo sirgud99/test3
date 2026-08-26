@@ -32,6 +32,7 @@ NORARE_VARIABLES = {
     "dominance": "Warriner-2013-AffectiveRatings-ENGLISH_DOMINANCE_MEAN",
 }
 LAYERS = {"last": -1, "penultimate": -2, "antepenultimate": -3}
+TOP_EIGENMODES = 20
 
 PROFILES = {
     "smoke": {
@@ -89,6 +90,12 @@ def parse_args() -> argparse.Namespace:
     analysis_options.add_argument("--analysis-batch-size", type=int, default=8)
     analysis_options.add_argument("--pair-stride", type=int, default=1)
     analysis_options.add_argument(
+        "--analysis-split",
+        choices=("train", "test"),
+        default="test",
+        help="Split used by pairs/annotate; analyze automatically runs train and test.",
+    )
+    analysis_options.add_argument(
         "--koopman-rank",
         type=int,
         default=None,
@@ -111,7 +118,7 @@ def parse_args() -> argparse.Namespace:
         "pairs", parents=[analysis_options], help="Build true/predicted utterance pairs."
     )
     commands.add_parser(
-        "annotate", parents=[profile_options], help="Annotate utterances with lexical features."
+        "annotate", parents=[analysis_options], help="Annotate utterances with lexical features."
     )
     commands.add_parser(
         "koopman", parents=[analysis_options], help="Fit and analyze six Koopman operators."
@@ -484,21 +491,23 @@ def construct_pairs(args: argparse.Namespace) -> None:
     model, tokenizer, dataset = load_assets(args.profile, checkpoint)
     device = torch.device("mps" if args.profile in ("smoke", "mac") else "cuda")
     model.to(device).eval()
+    split = args.analysis_split
 
     token_stream = np.asarray(
-        list(chain.from_iterable(dataset["test"]["input_ids"])), dtype=np.int64
+        list(chain.from_iterable(dataset[split]["input_ids"])), dtype=np.int64
     )
     possible = (len(token_stream) - BLOCK_SIZE - 1) // args.pair_stride + 1
     sample_count = (
         possible if args.analysis_samples is None else min(args.analysis_samples, possible)
     )
     if sample_count < 1:
-        raise RuntimeError("The test split is too short to form a shifted utterance pair.")
+        raise RuntimeError(f"The {split} split is too short to form a shifted utterance pair.")
     if args.analysis_samples is not None and sample_count < args.analysis_samples:
         print(f"Using all {sample_count} available pairs instead of {args.analysis_samples}.")
 
     starts = np.arange(sample_count) * args.pair_stride
     rows: list[dict[str, Any]] = []
+    correct_predictions = 0
     representations: dict[str, list[Any]] = {
         f"{kind}_{layer}": []
         for kind in ("source", "ground_truth", "predicted")
@@ -535,6 +544,7 @@ def construct_pairs(args: argparse.Namespace) -> None:
             )
 
         predicted_ids = predicted_tensor.cpu().numpy()
+        correct_predictions += int((predicted_tensor == true_tensor).sum().item())
         ground_truth = ground_truth_tensor.cpu().numpy()
         predicted_windows = predicted_window_tensor.cpu().numpy()
         for layer_name, layer_index in LAYERS.items():
@@ -582,21 +592,41 @@ def construct_pairs(args: argparse.Namespace) -> None:
 
         del current_output, ground_truth_output, predicted_output
 
-    output_dir = ARTIFACTS / args.profile / "analysis"
+    output_dir = ARTIFACTS / args.profile / "analysis" / split
     output_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows).to_csv(output_dir / "utterance_pairs.csv", index=False)
     arrays = {name: np.concatenate(parts) for name, parts in representations.items()}
     np.savez_compressed(output_dir / "representations.npz", **arrays)
+    accuracy = correct_predictions / sample_count
+    accuracy_report = {
+        "checkpoint": str(checkpoint),
+        "dataset_split": split,
+        "evaluated_next_tokens": sample_count,
+        "correct_predictions": correct_predictions,
+        "top_1_accuracy": accuracy,
+        "top_1_accuracy_percent": 100.0 * accuracy,
+        "window_size": BLOCK_SIZE,
+        "pair_stride": args.pair_stride,
+    }
+    (output_dir / "model_accuracy.json").write_text(
+        json.dumps(accuracy_report, indent=2) + "\n"
+    )
     metadata = {
         "checkpoint": str(checkpoint),
+        "dataset_split": split,
         "samples": sample_count,
         "window_size": BLOCK_SIZE,
         "pair_shift": 1,
         "pair_stride": args.pair_stride,
         "layers": LAYERS,
         "representation": "final-token hidden state",
+        "top_1_accuracy": accuracy,
     }
     (output_dir / "pairs_metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    print(
+        f"Analysis top-1 accuracy on {sample_count} {split} transitions: "
+        f"{accuracy:.2%} ({correct_predictions}/{sample_count})"
+    )
     print(f"Saved {sample_count} true/predicted pairs to {output_dir}")
 
     del model
@@ -649,7 +679,7 @@ def annotate(args: argparse.Namespace) -> None:
     import spacy
     from tqdm.auto import tqdm
 
-    output_dir = ARTIFACTS / args.profile / "analysis"
+    output_dir = ARTIFACTS / args.profile / "analysis" / args.analysis_split
     pair_path = output_dir / "utterance_pairs.csv"
     if not pair_path.exists():
         raise FileNotFoundError("Run the pairs command before annotate.")
@@ -732,8 +762,8 @@ def annotate(args: argparse.Namespace) -> None:
     print(f"Saved {len(features)} annotated utterances to {output_dir}")
 
 
-def feature_matrix(frame: Any) -> tuple[Any, list[str]]:
-    """Create an imputed, standardized regression matrix from utterance features."""
+def feature_matrix(frame: Any, statistics: dict[str, Any] | None = None) -> tuple[Any, dict[str, Any]]:
+    """Create a regression matrix, fitting or applying normalization statistics."""
     import numpy as np
     import pandas as pd
 
@@ -758,20 +788,145 @@ def feature_matrix(frame: Any) -> tuple[Any, list[str]]:
             )
         )
     categories = ["last_pos", "last_lexical_class", "last_noun_type"]
-    values = frame[numeric].apply(pd.to_numeric, errors="coerce")
-    for name in list(values.columns):
-        if values[name].isna().any():
-            values[f"{name}_missing"] = values[name].isna().astype(float)
-            median = values[name].median()
-            values[name] = values[name].fillna(0.0 if pd.isna(median) else median)
+    numeric_values = frame[numeric].apply(pd.to_numeric, errors="coerce")
+    missing_values = numeric_values.isna().astype(float).rename(
+        columns={name: f"{name}_missing" for name in numeric}
+    )
+    if statistics is None:
+        medians = numeric_values.median().fillna(0.0).to_numpy(dtype=np.float64)
+    else:
+        medians = statistics["numeric_medians"]
+    numeric_values = numeric_values.fillna(dict(zip(numeric, medians)))
     values = pd.concat(
-        (values, pd.get_dummies(frame[categories], prefix=categories, dummy_na=True)), axis=1
+        (
+            numeric_values,
+            missing_values,
+            pd.get_dummies(frame[categories], prefix=categories, dummy_na=True),
+        ),
+        axis=1,
     ).astype(float)
+    if statistics is not None:
+        values = values.reindex(columns=statistics["feature_names"], fill_value=0.0)
     matrix = values.to_numpy(dtype=np.float64)
-    means = matrix.mean(axis=0)
-    scales = matrix.std(axis=0)
-    scales[scales < 1e-12] = 1.0
-    return (matrix - means) / scales, list(values.columns)
+    if statistics is None:
+        means = matrix.mean(axis=0)
+        scales = matrix.std(axis=0)
+        scales[scales < 1e-12] = 1.0
+        statistics = {
+            "numeric_names": numeric,
+            "numeric_medians": medians,
+            "feature_names": list(values.columns),
+            "means": means,
+            "scales": scales,
+        }
+    return (matrix - statistics["means"]) / statistics["scales"], statistics
+
+
+def load_unembedding(checkpoint: Path) -> Any:
+    """Load only the saved output-projection weight, including tied embeddings."""
+    from safetensors import safe_open
+
+    index_path = checkpoint / "model.safetensors.index.json"
+    weight_map = json.loads(index_path.read_text())["weight_map"] if index_path.exists() else {}
+    for key in ("lm_head.weight", "model.embed_tokens.weight"):
+        if weight_map:
+            filename = weight_map.get(key)
+        else:
+            filename = "model.safetensors"
+        if filename and (checkpoint / filename).exists():
+            with safe_open(checkpoint / filename, framework="pt", device="cpu") as tensors:
+                if key in tensors.keys():
+                    return tensors.get_tensor(key)
+    raise FileNotFoundError(f"Could not find Qwen's unembedding weight in {checkpoint}.")
+
+
+def largest_singular_value(matrix: Any, device: Any, chunk_size: int = 2_048) -> float:
+    """Compute a tall matrix's largest singular value through its Gram matrix."""
+    import torch
+
+    hidden_size = matrix.shape[1]
+    gram = torch.zeros((hidden_size, hidden_size), device=device, dtype=torch.float32)
+    for start in range(0, matrix.shape[0], chunk_size):
+        rows = matrix[start : start + chunk_size].to(device=device, dtype=torch.float32)
+        gram.addmm_(rows.T, rows)
+    return float(torch.linalg.eigvalsh(gram)[-1].clamp_min(0.0).sqrt().cpu())
+
+
+def softmax_bound_metrics(
+    left_hidden: Any,
+    right_hidden: Any,
+    deltas: Any,
+    labels: Any,
+    unembedding: Any,
+    device: Any,
+    batch_size: int,
+) -> dict[str, Any]:
+    """Measure cross-entropy, KL divergence, and proposed/corrected bounds."""
+    import numpy as np
+    import torch
+    import torch.nn.functional as functional
+
+    collected = {
+        name: []
+        for name in (
+            "cross_entropy",
+            "entropy",
+            "kl_divergence",
+            "same_label_ce_difference",
+            "probability_l2_distance",
+            "hidden_distance",
+            "logit_distance",
+            "delta",
+            "proposed_bound",
+            "probability_logit_bound",
+            "same_label_ce_logit_bound",
+            "kl_logit_bound",
+        )
+    }
+    weight = unembedding.to(device)
+    for start in range(0, len(left_hidden), batch_size):
+        stop = start + batch_size
+        left = torch.as_tensor(left_hidden[start:stop], device=device, dtype=weight.dtype)
+        right = torch.as_tensor(right_hidden[start:stop], device=device, dtype=weight.dtype)
+        label = torch.as_tensor(labels[start:stop], device=device, dtype=torch.long)
+        with torch.inference_mode():
+            left_logits = functional.linear(left, weight).float()
+            right_logits = functional.linear(right, weight).float()
+            left_log_probabilities = torch.log_softmax(left_logits, dim=-1)
+            right_log_probabilities = torch.log_softmax(right_logits, dim=-1)
+            probabilities = left_log_probabilities.exp()
+            entropy = -(probabilities * left_log_probabilities).sum(dim=-1)
+            cross_entropy = -(probabilities * right_log_probabilities).sum(dim=-1)
+            kl_divergence = (
+                probabilities * (left_log_probabilities - right_log_probabilities)
+            ).sum(dim=-1).clamp_min(0.0)
+            left_label_loss = -left_log_probabilities.gather(1, label[:, None]).squeeze(1)
+            right_label_loss = -right_log_probabilities.gather(1, label[:, None]).squeeze(1)
+            same_label_ce_difference = (left_label_loss - right_label_loss).abs()
+            right_probabilities = right_log_probabilities.exp()
+            probability_l2_distance = torch.linalg.vector_norm(
+                probabilities - right_probabilities, dim=-1
+            )
+            hidden_distance = torch.linalg.vector_norm(left.float() - right.float(), dim=-1)
+            logit_distance = torch.linalg.vector_norm(left_logits - right_logits, dim=-1)
+        values = {
+            "cross_entropy": cross_entropy,
+            "entropy": entropy,
+            "kl_divergence": kl_divergence,
+            "same_label_ce_difference": same_label_ce_difference,
+            "probability_l2_distance": probability_l2_distance,
+            "hidden_distance": hidden_distance,
+            "logit_distance": logit_distance,
+            "delta": torch.as_tensor(deltas[start:stop], device=device),
+            "proposed_bound": math.sqrt(2.0)
+            * torch.as_tensor(deltas[start:stop], device=device),
+            "probability_logit_bound": 0.5 * logit_distance,
+            "same_label_ce_logit_bound": math.sqrt(2.0) * logit_distance,
+            "kl_logit_bound": math.sqrt(2.0) * logit_distance,
+        }
+        for name, value in values.items():
+            collected[name].append(value.float().cpu().numpy())
+    return {name: np.concatenate(parts) for name, parts in collected.items()}
 
 
 def fit_koopman(source: Any, target: Any, rank: int | None, ridge: float) -> dict[str, Any]:
@@ -806,7 +961,11 @@ def fit_koopman(source: Any, target: Any, rank: int | None, ridge: float) -> dic
     order = np.argsort(np.abs(eigenvalues))[::-1]
     eigenvalues = eigenvalues[order]
     eigenvectors = eigenvectors[:, order]
-    alignments = np.abs(source_coordinates @ eigenvectors)
+    raw_activations = np.abs(source_coordinates @ eigenvectors)
+    activation_means = raw_activations.mean(axis=0)
+    activation_scales = raw_activations.std(axis=0)
+    activation_scales[activation_scales < 1e-12] = 1.0
+    zscored_activations = (raw_activations - activation_means) / activation_scales
     operator_singular_values = np.linalg.svd(operator, compute_uv=False)
     participation = operator_singular_values.sum() ** 2 / np.sum(operator_singular_values**2)
     stable_rank = np.sum(operator_singular_values**2) / operator_singular_values[0] ** 2
@@ -816,13 +975,18 @@ def fit_koopman(source: Any, target: Any, rank: int | None, ridge: float) -> dic
         "center": center,
         "scale": scale,
         "eigenvalues": eigenvalues,
-        "alignments": alignments,
+        "eigenvectors": eigenvectors,
+        "raw_activations": raw_activations,
+        "zscored_activations": zscored_activations,
+        "activation_means": activation_means,
+        "activation_scales": activation_scales,
         "rank": fitted_rank,
         "r2": float(1.0 - residual / total) if total > 0 else float("nan"),
         "rmse": float(np.sqrt(np.mean((target_coordinates - prediction) ** 2))),
         "spectral_radius": float(np.max(np.abs(eigenvalues))),
         "effective_dimension": float(participation),
         "stable_rank": float(stable_rank),
+        "smallest_singular_value": float(operator_singular_values[-1]),
         "numerical_rank": int(np.linalg.matrix_rank(operator)),
     }
 
@@ -836,13 +1000,21 @@ def plot_koopman(result: dict[str, Any], coefficients: Any, path: Path, title: s
     import numpy as np
 
     eigenvalues = result["eigenvalues"]
-    alignments = result["alignments"]
-    normalized = alignments / np.maximum(alignments.max(axis=0, keepdims=True), 1e-12)
+    activations = result["zscored_activations"]
     coefficient_values = coefficients.to_numpy(dtype=float)
-    feature_strength = np.max(np.abs(coefficient_values), axis=0)
-    selected = np.argsort(feature_strength)[-20:]
+    plotted_modes = min(TOP_EIGENMODES, result["rank"])
+    visible = np.asarray(
+        [
+            index
+            for index, name in enumerate(coefficients.columns)
+            if "coverage" not in name.lower() and "missing" not in name.lower()
+        ]
+    )
+    displayed_activations = activations[:, :plotted_modes]
+    displayed_coefficients = coefficient_values[:plotted_modes, visible].T
 
-    figure, axes = plt.subplots(1, 3, figsize=(18, 5))
+    figure_height = max(7.0, 0.27 * len(visible))
+    figure, axes = plt.subplots(1, 3, figsize=(22, figure_height))
     angle = np.linspace(0, 2 * np.pi, 300)
     axes[0].plot(np.cos(angle), np.sin(angle), color="lightgray", linewidth=1)
     axes[0].scatter(eigenvalues.real, eigenvalues.imag, c=np.arange(len(eigenvalues)))
@@ -850,16 +1022,39 @@ def plot_koopman(result: dict[str, Any], coefficients: Any, path: Path, title: s
     axes[0].axvline(0, color="gray", linewidth=0.5)
     axes[0].set(xlabel="Real", ylabel="Imaginary", title="Eigenvalue spectrum")
     axes[0].set_aspect("equal", adjustable="box")
-    axes[1].imshow(normalized.T, aspect="auto", interpolation="nearest", cmap="viridis")
-    axes[1].set(xlabel="Utterance pair", ylabel="Eigenmode", title="Mode alignment")
+    activation_limit = max(float(np.max(np.abs(displayed_activations))), 1e-12)
+    activation_image = axes[1].imshow(
+        displayed_activations,
+        aspect="auto",
+        interpolation="nearest",
+        cmap="coolwarm",
+        vmin=-activation_limit,
+        vmax=activation_limit,
+    )
+    axes[1].set(
+        xlabel="Eigenmode",
+        ylabel="Utterance pair",
+        title=f"Z-scored activation: top {plotted_modes} modes",
+    )
+    axes[1].set_xticks(range(plotted_modes))
+    figure.colorbar(activation_image, ax=axes[1], shrink=0.8)
+    coefficient_limit = max(float(np.max(np.abs(displayed_coefficients))), 1e-12)
     image = axes[2].imshow(
-        coefficient_values[:, selected], aspect="auto", interpolation="nearest", cmap="coolwarm"
+        displayed_coefficients,
+        aspect="auto",
+        interpolation="nearest",
+        cmap="coolwarm",
+        vmin=-coefficient_limit,
+        vmax=coefficient_limit,
     )
-    axes[2].set_xticks(range(len(selected)))
-    axes[2].set_xticklabels(
-        [coefficients.columns[index] for index in selected], rotation=90, fontsize=7
+    axes[2].set_xticks(range(plotted_modes))
+    axes[2].set_yticks(range(len(visible)))
+    axes[2].set_yticklabels([coefficients.columns[index] for index in visible], fontsize=7)
+    axes[2].set(
+        xlabel="Eigenmode",
+        ylabel="Feature",
+        title="Z-scored activation regression coefficients",
     )
-    axes[2].set(xlabel="Feature", ylabel="Eigenmode", title="Mode regression coefficients")
     figure.colorbar(image, ax=axes[2], shrink=0.8)
     figure.suptitle(title)
     figure.tight_layout()
@@ -868,40 +1063,226 @@ def plot_koopman(result: dict[str, Any], coefficients: Any, path: Path, title: s
 
 
 def koopman(args: argparse.Namespace) -> None:
-    """Fit six Koopman matrices and regress every eigenmode on annotations."""
+    """Fit six training-set Koopman matrices and evaluate them on test data."""
     import numpy as np
     import pandas as pd
+    import torch
 
     if (
         (args.koopman_rank is not None and args.koopman_rank < 1)
         or args.ridge_alpha < 0
-        or args.top_utterances < 1
+        or not 10 <= args.top_utterances <= 20
     ):
         raise ValueError(
-            "Any Koopman rank and top utterances must be positive; ridge must be nonnegative."
+            "Any Koopman rank must be positive, ridge must be nonnegative, and top "
+            "utterances must be between 10 and 20."
         )
     output_dir = ARTIFACTS / args.profile / "analysis"
-    feature_path = output_dir / "utterance_features.csv"
-    representation_path = output_dir / "representations.npz"
-    if not feature_path.exists() or not representation_path.exists():
-        raise FileNotFoundError("Run pairs and annotate before koopman.")
+    split_data = {}
+    for split in ("train", "test"):
+        split_dir = output_dir / split
+        feature_path = split_dir / "utterance_features.csv"
+        representation_path = split_dir / "representations.npz"
+        if not feature_path.exists() or not representation_path.exists():
+            raise FileNotFoundError(f"Run pairs and annotate for the {split} split first.")
+        split_data[split] = (
+            pd.read_csv(feature_path),
+            np.load(representation_path),
+        )
 
-    features = pd.read_csv(feature_path)
-    representations = np.load(representation_path)
+    train_features, train_representations = split_data["train"]
+    test_features, test_representations = split_data["test"]
+    checkpoint = args.checkpoint or ARTIFACTS / args.profile / "final"
+    device = torch.device("mps" if args.profile in ("smoke", "mac") else "cuda")
+    unembedding = load_unembedding(checkpoint).to(device)
+    unembedding_sigma_max = largest_singular_value(unembedding, device)
     summary_rows = []
     mode_rows = []
     coefficient_rows = []
     aligned_rows = []
+    theory_rows = []
+    surprisal_bound_rows = []
 
     for layer in LAYERS:
-        source = representations[f"source_{layer}"].astype(np.float64)
+        train_source = train_representations[f"source_{layer}"].astype(np.float64)
+        test_source = test_representations[f"source_{layer}"].astype(np.float64)
         for target_type in ("ground_truth", "predicted"):
-            target = representations[f"{target_type}_{layer}"].astype(np.float64)
-            branch = features[features["target_type"] == target_type].sort_values("pair_id")
-            if len(branch) != len(source):
+            train_target = train_representations[f"{target_type}_{layer}"].astype(np.float64)
+            test_target = test_representations[f"{target_type}_{layer}"].astype(np.float64)
+            train_branch = train_features[
+                train_features["target_type"] == target_type
+            ].sort_values("pair_id")
+            test_branch = test_features[
+                test_features["target_type"] == target_type
+            ].sort_values("pair_id")
+            if len(train_branch) != len(train_source) or len(test_branch) != len(test_source):
                 raise RuntimeError("Feature rows and representation rows do not align.")
-            regression_matrix, feature_names = feature_matrix(branch)
-            result = fit_koopman(source, target, args.koopman_rank, args.ridge_alpha)
+
+            train_matrix, feature_statistics = feature_matrix(train_branch)
+            test_matrix, _ = feature_matrix(test_branch, feature_statistics)
+            feature_names = feature_statistics["feature_names"]
+            result = fit_koopman(
+                train_source, train_target, args.koopman_rank, args.ridge_alpha
+            )
+            test_source_coordinates = (
+                (test_source - result["center"]) @ result["basis"] / result["scale"]
+            )
+            test_target_coordinates = (
+                (test_target - result["center"]) @ result["basis"] / result["scale"]
+            )
+            test_prediction = test_source_coordinates @ result["operator"]
+            test_residual = np.sum((test_target_coordinates - test_prediction) ** 2)
+            test_total = np.sum(
+                (test_target_coordinates - test_target_coordinates.mean(axis=0)) ** 2
+            )
+            test_transition_r2 = (
+                float(1.0 - test_residual / test_total) if test_total > 0 else float("nan")
+            )
+            test_transition_rmse = float(
+                np.sqrt(np.mean((test_target_coordinates - test_prediction) ** 2))
+            )
+            test_raw_activations = np.abs(
+                test_source_coordinates @ result["eigenvectors"]
+            )
+            test_zscored_activations = (
+                test_raw_activations - result["activation_means"]
+            ) / result["activation_scales"]
+
+            if layer == "last":
+                true_token_ids = test_branch["true_next_token_id"].to_numpy()
+                predicted_target_hidden = (
+                    (test_prediction * result["scale"]) @ result["basis"].T
+                    + result["center"]
+                )
+                direct_deltas = np.linalg.norm(
+                    test_target - predicted_target_hidden, axis=1
+                )
+                direct_metrics = softmax_bound_metrics(
+                    test_target,
+                    predicted_target_hidden,
+                    direct_deltas,
+                    true_token_ids,
+                    unembedding,
+                    device,
+                    args.analysis_batch_size,
+                )
+                if target_type == "ground_truth":
+                    coordinate_operator = (
+                        result["operator"] / result["scale"][:, None]
+                    ) * result["scale"][None, :]
+                    hidden_operator = (
+                        result["basis"] @ coordinate_operator @ result["basis"].T
+                    )
+                    hidden_operator_sigma_min = float(
+                        np.linalg.svd(hidden_operator, compute_uv=False)[-1]
+                    )
+                    per_utterance_mse = np.mean(
+                        (test_target - predicted_target_hidden) ** 2, axis=1
+                    )
+                    model_surprisal = test_branch[
+                        "true_next_token_surprisal"
+                    ].to_numpy(dtype=np.float64)
+                    k_sigma_min = hidden_operator_sigma_min
+                    multiplier = (
+                        math.sqrt(2.0) * unembedding_sigma_max / k_sigma_min
+                        if k_sigma_min > 0
+                        else float("inf")
+                    )
+                    requested_bound = multiplier * per_utterance_mse
+                    l2_error = np.sqrt(test_target.shape[1] * per_utterance_mse)
+                    l2_bound = multiplier * l2_error
+                    for index, pair_id in enumerate(test_branch["pair_id"].to_numpy()):
+                        surprisal_bound_rows.append(
+                            {
+                                "pair_id": int(pair_id),
+                                "true_next_token_id": int(true_token_ids[index]),
+                                "true_next_token": test_branch.iloc[index]["true_next_token"],
+                                "surprisal": model_surprisal[index],
+                                "k_hidden_mse": per_utterance_mse[index],
+                                "k_hidden_l2_error": l2_error[index],
+                                "unembedding_sigma_max": unembedding_sigma_max,
+                                "k_hidden_space_sigma_min": k_sigma_min,
+                                "requested_mse_bound": requested_bound[index],
+                                "requested_mse_bound_holds": bool(
+                                    model_surprisal[index] <= requested_bound[index]
+                                ),
+                                "l2_error_bound": l2_bound[index],
+                                "l2_error_bound_holds": bool(
+                                    model_surprisal[index] <= l2_bound[index]
+                                ),
+                            }
+                        )
+                inverse = np.linalg.pinv(result["operator"])
+                preimage_coordinates = test_target_coordinates @ inverse
+                preimage_hidden = (
+                    (preimage_coordinates * result["scale"]) @ result["basis"].T
+                    + result["center"]
+                )
+                coordinate_deltas = np.linalg.norm(
+                    test_target_coordinates - test_prediction, axis=1
+                )
+                inverse_distances = np.linalg.norm(
+                    test_source_coordinates - preimage_coordinates, axis=1
+                )
+                smallest_singular_value = result["smallest_singular_value"]
+                inverse_bounds = (
+                    coordinate_deltas / smallest_singular_value
+                    if smallest_singular_value > 0
+                    else np.full_like(coordinate_deltas, np.inf)
+                )
+                preimage_metrics = softmax_bound_metrics(
+                    test_source,
+                    preimage_hidden,
+                    coordinate_deltas,
+                    true_token_ids,
+                    unembedding,
+                    device,
+                    args.analysis_batch_size,
+                )
+                pair_ids = test_branch["pair_id"].to_numpy()
+                for comparison, metrics in (
+                    ("direct_target", direct_metrics),
+                    ("preimage", preimage_metrics),
+                ):
+                    for index, pair_id in enumerate(pair_ids):
+                        row = {
+                            "comparison": comparison,
+                            "target_type": target_type,
+                            "pair_id": int(pair_id),
+                            **{name: value[index] for name, value in metrics.items()},
+                        }
+                        row["proposed_cross_entropy_holds"] = bool(
+                            row["cross_entropy"] <= row["proposed_bound"] + 1e-6
+                        )
+                        row["proposed_same_label_ce_difference_holds"] = bool(
+                            row["same_label_ce_difference"]
+                            <= row["proposed_bound"] + 1e-6
+                        )
+                        row["same_label_ce_logit_bound_holds"] = bool(
+                            row["same_label_ce_difference"]
+                            <= row["same_label_ce_logit_bound"] + 1e-6
+                        )
+                        row["proposed_probability_distance_holds"] = bool(
+                            row["probability_l2_distance"]
+                            <= row["proposed_bound"] + 1e-6
+                        )
+                        row["softmax_lipschitz_probability_bound_holds"] = bool(
+                            row["probability_l2_distance"]
+                            <= row["probability_logit_bound"] + 1e-6
+                        )
+                        row["proposed_kl_holds"] = bool(
+                            row["kl_divergence"] <= row["proposed_bound"] + 1e-6
+                        )
+                        row["corrected_kl_holds"] = bool(
+                            row["kl_divergence"] <= row["kl_logit_bound"] + 1e-6
+                        )
+                        if comparison == "preimage":
+                            row["coordinate_delta"] = coordinate_deltas[index]
+                            row["preimage_coordinate_distance"] = inverse_distances[index]
+                            row["inverse_distance_bound"] = inverse_bounds[index]
+                            row["smallest_singular_value"] = smallest_singular_value
+                        theory_rows.append(row)
+
             stem = f"{layer}_{target_type}"
             np.save(output_dir / f"K_{stem}.npy", result["operator"])
             np.savez_compressed(
@@ -910,20 +1291,52 @@ def koopman(args: argparse.Namespace) -> None:
                 center=result["center"],
                 scale=result["scale"],
                 eigenvalues=result["eigenvalues"],
+                eigenvectors=result["eigenvectors"],
+                train_raw_mode_activations=result["raw_activations"].astype(np.float32),
+                train_zscored_mode_activations=result["zscored_activations"].astype(np.float32),
+                test_raw_mode_activations=test_raw_activations.astype(np.float32),
+                test_zscored_mode_activations=test_zscored_activations.astype(np.float32),
+                activation_means=result["activation_means"],
+                activation_scales=result["activation_scales"],
+                feature_names=np.asarray(feature_names),
+                numeric_feature_names=np.asarray(feature_statistics["numeric_names"]),
+                feature_medians=feature_statistics["numeric_medians"],
+                feature_means=feature_statistics["means"],
+                feature_scales=feature_statistics["scales"],
             )
 
             coefficients = []
+            gram = train_matrix.T @ train_matrix
+            regularized_gram = gram + args.ridge_alpha * np.eye(gram.shape[0])
             for mode in range(result["rank"]):
-                alignment = result["alignments"][:, mode]
-                centered = alignment - alignment.mean()
-                gram = regression_matrix.T @ regression_matrix
+                raw_activation = result["raw_activations"][:, mode]
+                zscored_activation = result["zscored_activations"][:, mode]
+                test_raw_activation = test_raw_activations[:, mode]
+                test_zscored_activation = test_zscored_activations[:, mode]
                 regression = np.linalg.solve(
-                    gram + args.ridge_alpha * np.eye(gram.shape[0]),
-                    regression_matrix.T @ centered,
+                    regularized_gram,
+                    train_matrix.T @ zscored_activation,
                 )
-                fitted = regression_matrix @ regression + alignment.mean()
-                total = np.sum((alignment - alignment.mean()) ** 2)
-                mode_r2 = 1.0 - np.sum((alignment - fitted) ** 2) / total if total > 0 else np.nan
+                train_fitted = train_matrix @ regression
+                test_fitted = test_matrix @ regression
+                train_total = np.sum(zscored_activation**2)
+                test_mode_total = np.sum(
+                    (test_zscored_activation - test_zscored_activation.mean()) ** 2
+                )
+                train_mode_r2 = (
+                    1.0 - np.sum((zscored_activation - train_fitted) ** 2) / train_total
+                    if train_total > 0
+                    else np.nan
+                )
+                test_mode_r2 = (
+                    1.0
+                    - np.sum((test_zscored_activation - test_fitted) ** 2) / test_mode_total
+                    if test_mode_total > 0
+                    else np.nan
+                )
+                test_mode_rmse = float(
+                    np.sqrt(np.mean((test_zscored_activation - test_fitted) ** 2))
+                )
                 coefficients.append(regression)
                 eigenvalue = result["eigenvalues"][mode]
                 top_features = np.argsort(np.abs(regression))[::-1][:10]
@@ -935,7 +1348,11 @@ def koopman(args: argparse.Namespace) -> None:
                         "eigenvalue_real": eigenvalue.real,
                         "eigenvalue_imag": eigenvalue.imag,
                         "eigenvalue_magnitude": abs(eigenvalue),
-                        "feature_regression_r2": mode_r2,
+                        "raw_activation_mean": result["activation_means"][mode],
+                        "raw_activation_std": result["activation_scales"][mode],
+                        "train_feature_regression_r2": train_mode_r2,
+                        "test_feature_regression_r2": test_mode_r2,
+                        "test_feature_regression_rmse": test_mode_rmse,
                         "top_features": "; ".join(
                             f"{feature_names[index]}={regression[index]:.5g}"
                             for index in top_features
@@ -952,39 +1369,52 @@ def koopman(args: argparse.Namespace) -> None:
                             "coefficient": value,
                         }
                     )
-                for rank_index, row_index in enumerate(
-                    np.argsort(alignment)[::-1][: args.top_utterances], start=1
-                ):
-                    utterance = branch.iloc[row_index]
-                    aligned_rows.append(
-                        {
-                            "layer": layer,
-                            "target_type": target_type,
-                            "mode": mode,
-                            "rank": rank_index,
-                            "alignment": alignment[row_index],
-                            "pair_id": int(utterance["pair_id"]),
-                            "utterance": utterance["target_utterance"],
-                        }
-                    )
+                if mode < TOP_EIGENMODES:
+                    for data_split, branch, raw_values, zscored_values in (
+                        ("train", train_branch, raw_activation, zscored_activation),
+                        ("test", test_branch, test_raw_activation, test_zscored_activation),
+                    ):
+                        for rank_index, row_index in enumerate(
+                            np.argsort(raw_values)[::-1][: args.top_utterances], start=1
+                        ):
+                            utterance = branch.iloc[row_index]
+                            aligned_rows.append(
+                                {
+                                    "data_split": data_split,
+                                    "layer": layer,
+                                    "target_type": target_type,
+                                    "mode": mode,
+                                    "eigenvalue_magnitude": abs(eigenvalue),
+                                    "rank": rank_index,
+                                    "raw_activation": raw_values[row_index],
+                                    "zscored_activation": zscored_values[row_index],
+                                    "pair_id": int(utterance["pair_id"]),
+                                    "utterance": utterance["target_utterance"],
+                                }
+                            )
 
             coefficient_frame = pd.DataFrame(coefficients, columns=feature_names)
+            plot_result = result | {"zscored_activations": test_zscored_activations}
             plot_koopman(
-                result,
+                plot_result,
                 coefficient_frame,
                 output_dir / f"eigenmodes_{stem}.png",
-                f"{layer.replace('_', ' ').title()} layer — {target_type.replace('_', ' ')}",
+                f"{layer.replace('_', ' ').title()} layer — "
+                f"{target_type.replace('_', ' ')} — test activations",
             )
             summary_rows.append(
                 {
                     "layer": layer,
                     "target_type": target_type,
                     "koopman_rank": result["rank"],
-                    "transition_r2": result["r2"],
-                    "transition_rmse": result["rmse"],
+                    "train_transition_r2": result["r2"],
+                    "train_transition_rmse": result["rmse"],
+                    "test_transition_r2": test_transition_r2,
+                    "test_transition_rmse": test_transition_rmse,
                     "spectral_radius": result["spectral_radius"],
                     "effective_dimension": result["effective_dimension"],
                     "stable_rank": result["stable_rank"],
+                    "smallest_singular_value": result["smallest_singular_value"],
                     "numerical_rank": result["numerical_rank"],
                 }
             )
@@ -994,10 +1424,81 @@ def koopman(args: argparse.Namespace) -> None:
     pd.DataFrame(mode_rows).to_csv(output_dir / "eigenmode_regressions.csv", index=False)
     pd.DataFrame(coefficient_rows).to_csv(output_dir / "eigenmode_coefficients.csv", index=False)
     pd.DataFrame(aligned_rows).to_csv(output_dir / "eigenmode_utterances.csv", index=False)
+    theory_frame = pd.DataFrame(theory_rows)
+    theory_frame.to_csv(output_dir / "theory_bound_samples.csv", index=False)
+    theory_summary = (
+        theory_frame.groupby(["comparison", "target_type"], as_index=False)
+        .agg(
+            samples=("pair_id", "size"),
+            mean_delta=("delta", "mean"),
+            mean_hidden_distance=("hidden_distance", "mean"),
+            mean_cross_entropy=("cross_entropy", "mean"),
+            mean_same_label_ce_difference=("same_label_ce_difference", "mean"),
+            mean_kl_divergence=("kl_divergence", "mean"),
+            mean_probability_l2_distance=("probability_l2_distance", "mean"),
+            proposed_probability_distance_pass_rate=(
+                "proposed_probability_distance_holds",
+                "mean",
+            ),
+            softmax_lipschitz_probability_pass_rate=(
+                "softmax_lipschitz_probability_bound_holds",
+                "mean",
+            ),
+            proposed_cross_entropy_pass_rate=("proposed_cross_entropy_holds", "mean"),
+            proposed_same_label_ce_difference_pass_rate=(
+                "proposed_same_label_ce_difference_holds",
+                "mean",
+            ),
+            same_label_ce_logit_bound_pass_rate=(
+                "same_label_ce_logit_bound_holds",
+                "mean",
+            ),
+            proposed_kl_pass_rate=("proposed_kl_holds", "mean"),
+            corrected_kl_pass_rate=("corrected_kl_holds", "mean"),
+        )
+    )
+    theory_summary.to_csv(output_dir / "theory_bound_summary.csv", index=False)
+    surprisal_bound_frame = pd.DataFrame(surprisal_bound_rows)
+    satisfying = int(surprisal_bound_frame["requested_mse_bound_holds"].sum())
+    percentage = 100.0 * satisfying / len(surprisal_bound_frame)
+    raw_bounds = surprisal_bound_frame["requested_mse_bound"].to_numpy(dtype=float)
+    raw_surprisals = surprisal_bound_frame["surprisal"].to_numpy(dtype=float)
+    ratios = pd.Series(
+        np.divide(
+            raw_surprisals,
+            raw_bounds,
+            out=np.full_like(raw_surprisals, np.inf),
+            where=raw_bounds > 0,
+        )
+    )
+    finite_ratios = ratios[np.isfinite(ratios)]
+    surprisal_bound_summary = {
+        "samples": len(surprisal_bound_frame),
+        "satisfying_utterances": satisfying,
+        "percentage_satisfying_bound": percentage,
+        "mean_surprisal": float(surprisal_bound_frame["surprisal"].mean()),
+        "mean_k_hidden_mse": float(surprisal_bound_frame["k_hidden_mse"].mean()),
+        "unembedding_sigma_max": unembedding_sigma_max,
+        "k_hidden_space_sigma_min": float(
+            surprisal_bound_frame["k_hidden_space_sigma_min"].iloc[0]
+        ),
+        "requested_mse_bound_pass_rate": float(
+            surprisal_bound_frame["requested_mse_bound_holds"].mean()
+        ),
+        "median_surprisal_to_bound_ratio": float(finite_ratios.median()),
+        "l2_error_bound_pass_rate": float(
+            surprisal_bound_frame["l2_error_bound_holds"].mean()
+        ),
+    }
+    (output_dir / "surprisal_bound_summary.json").write_text(
+        json.dumps(surprisal_bound_summary, indent=2) + "\n"
+    )
     summary = {
         "operators": len(summary_rows),
         "layers": list(LAYERS),
         "targets": ["ground_truth", "predicted"],
+        "operator_fit_split": "train",
+        "operator_evaluation_split": "test",
         "lifting_function": "final-token hidden representation produced by each learned layer",
         "fit": (
             "full hidden-space ridge regression Y = X K"
@@ -1005,9 +1506,73 @@ def koopman(args: argparse.Namespace) -> None:
             else f"POD-reduced rank-{args.koopman_rank} ridge regression Y = X K"
         ),
         "effective_dimension": "singular-value participation ratio of K",
+        "mode_regressions": (
+            "all eigenmodes; fit on training z-scored activations and features, "
+            "then evaluated on test data"
+        ),
+        "feature_normalization": (
+            "fit separately on ground_truth and predicted training utterances; "
+            "the corresponding training statistics transform test utterances"
+        ),
+        "raw_values": "raw features in train/test utterance_features.csv; train/test raw "
+        "and z-scored mode activations in each koopman_state_*.npz",
+        "heatmaps": (
+            f"display the {TOP_EIGENMODES} eigenmodes with largest eigenvalue magnitude; "
+            "coefficient heatmaps hide feature names containing coverage or missing"
+        ),
+        "saved_utterances": (
+            f"top {args.top_utterances} train and test utterances for the "
+            f"{TOP_EIGENMODES} eigenmodes with largest eigenvalue magnitude"
+        ),
+        "theory_test": (
+            "last-layer pointwise test on held-out utterances; the primary quantity "
+            "is the same-fixed-label cross-entropy loss difference from the cited "
+            "sqrt(2)-Lipschitz result; probability distance, raw cross-entropy, and "
+            "KL are additional diagnostics"
+        ),
+        "requested_surprisal_test": (
+            "per-test-utterance surprisal <= hidden-state MSE * sqrt(2) * "
+            "sigma_max(U) / sigma_min(K), plus the norm-consistent version "
+            "using sqrt(hidden_dimension * MSE)"
+        ),
     }
     (output_dir / "koopman_metadata.json").write_text(json.dumps(summary, indent=2) + "\n")
     import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(1, 2, figsize=(13, 5))
+    colors = np.where(
+        surprisal_bound_frame["requested_mse_bound_holds"], "tab:green", "tab:red"
+    )
+    positive_bounds = raw_bounds[raw_bounds > 0]
+    positive_surprisals = raw_surprisals[raw_surprisals > 0]
+    bound_floor = float(positive_bounds.min() / 2) if len(positive_bounds) else 1e-12
+    surprisal_floor = (
+        float(positive_surprisals.min() / 2) if len(positive_surprisals) else 1e-12
+    )
+    x_values = np.maximum(raw_bounds, bound_floor)
+    y_values = np.maximum(raw_surprisals, surprisal_floor)
+    lower = min(float(x_values.min()), float(y_values.min()))
+    upper = max(float(x_values.max()), float(y_values.max()))
+    axes[0].scatter(x_values, y_values, c=colors, s=5, alpha=0.25, rasterized=True)
+    axes[0].plot([lower, upper], [lower, upper], color="black", linestyle="--")
+    axes[0].set_xscale("log")
+    axes[0].set_yscale("log")
+    axes[0].set(
+        xlabel="Proposed upper bound",
+        ylabel="True-token surprisal",
+        title=f"{percentage:.2f}% satisfy surprisal ≤ bound",
+    )
+    finite_log_ratios = np.log10(finite_ratios.clip(lower=1e-30))
+    axes[1].hist(finite_log_ratios, bins=60, color="steelblue")
+    axes[1].axvline(0.0, color="black", linestyle="--")
+    axes[1].set(
+        xlabel="log10(surprisal / bound)",
+        ylabel="Utterances",
+        title="Distance from the bound (≤ 0 satisfies)",
+    )
+    figure.tight_layout()
+    figure.savefig(output_dir / "surprisal_bound.png", dpi=180)
+    plt.close(figure)
 
     labels = [f"{row['layer']}\n{row['target_type']}" for row in summary_rows]
     figure, axis = plt.subplots(figsize=(11, 5))
@@ -1018,12 +1583,21 @@ def koopman(args: argparse.Namespace) -> None:
     figure.savefig(output_dir / "effective_dimensions.png", dpi=180)
     plt.close(figure)
     print(summary_frame.to_string(index=False))
+    print(theory_summary.to_string(index=False))
+    print(json.dumps(surprisal_bound_summary, indent=2))
 
 
 def analyze(args: argparse.Namespace) -> None:
-    """Run utterance construction, feature annotation, and Koopman analysis."""
-    construct_pairs(args)
-    annotate(args)
+    """Fit the analysis on training utterances and evaluate it on test utterances."""
+    accuracy = {}
+    for split in ("train", "test"):
+        args.analysis_split = split
+        construct_pairs(args)
+        annotate(args)
+        report_path = ARTIFACTS / args.profile / "analysis" / split / "model_accuracy.json"
+        accuracy[split] = json.loads(report_path.read_text())
+    accuracy_path = ARTIFACTS / args.profile / "analysis" / "model_accuracy.json"
+    accuracy_path.write_text(json.dumps(accuracy, indent=2) + "\n")
     koopman(args)
 
 
