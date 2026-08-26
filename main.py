@@ -849,7 +849,8 @@ def largest_singular_value(matrix: Any, device: Any, chunk_size: int = 2_048) ->
     for start in range(0, matrix.shape[0], chunk_size):
         rows = matrix[start : start + chunk_size].to(device=device, dtype=torch.float32)
         gram.addmm_(rows.T, rows)
-    return float(torch.linalg.eigvalsh(gram)[-1].clamp_min(0.0).sqrt().cpu())
+    eigenvalues = torch.linalg.eigvalsh(gram.cpu())
+    return float(eigenvalues[-1].clamp_min(0.0).sqrt())
 
 
 def softmax_bound_metrics(
@@ -888,7 +889,10 @@ def softmax_bound_metrics(
         stop = start + batch_size
         left = torch.as_tensor(left_hidden[start:stop], device=device, dtype=weight.dtype)
         right = torch.as_tensor(right_hidden[start:stop], device=device, dtype=weight.dtype)
-        label = torch.as_tensor(labels[start:stop], device=device, dtype=torch.long)
+        label = torch.tensor(labels[start:stop].copy(), device=device, dtype=torch.long)
+        delta = torch.as_tensor(
+            deltas[start:stop], device=device, dtype=torch.float32
+        )
         with torch.inference_mode():
             left_logits = functional.linear(left, weight).float()
             right_logits = functional.linear(right, weight).float()
@@ -917,9 +921,8 @@ def softmax_bound_metrics(
             "probability_l2_distance": probability_l2_distance,
             "hidden_distance": hidden_distance,
             "logit_distance": logit_distance,
-            "delta": torch.as_tensor(deltas[start:stop], device=device),
-            "proposed_bound": math.sqrt(2.0)
-            * torch.as_tensor(deltas[start:stop], device=device),
+            "delta": delta,
+            "proposed_bound": math.sqrt(2.0) * delta,
             "probability_logit_bound": 0.5 * logit_distance,
             "same_label_ce_logit_bound": math.sqrt(2.0) * logit_distance,
             "kl_logit_bound": math.sqrt(2.0) * logit_distance,
