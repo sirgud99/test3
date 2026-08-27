@@ -91,9 +91,15 @@ def parse_args() -> argparse.Namespace:
     analysis_options.add_argument("--pair-stride", type=int, default=1)
     analysis_options.add_argument(
         "--analysis-split",
-        choices=("train", "test"),
+        choices=("train", "validation", "test"),
         default="test",
-        help="Split used by pairs/annotate; analyze automatically runs train and test.",
+        help="Split used by pairs/annotate.",
+    )
+    analysis_options.add_argument(
+        "--koopman-fit-split",
+        choices=("train", "validation", "test"),
+        default="validation",
+        help="Split used to fit K and feature regressions (default: validation).",
     )
     analysis_options.add_argument(
         "--koopman-rank",
@@ -1067,7 +1073,7 @@ def plot_koopman(result: dict[str, Any], coefficients: Any, path: Path, title: s
 
 
 def koopman(args: argparse.Namespace) -> None:
-    """Fit six training-set Koopman matrices and evaluate them on test data."""
+    """Fit six Koopman matrices on the selected split and evaluate on test data."""
     import numpy as np
     import pandas as pd
     import torch
@@ -1082,8 +1088,10 @@ def koopman(args: argparse.Namespace) -> None:
             "utterances must be between 10 and 20."
         )
     output_dir = ARTIFACTS / args.profile / "analysis"
+    fit_split = args.koopman_fit_split
+    evaluation_split = "test"
     split_data = {}
-    for split in ("train", "test"):
+    for split in dict.fromkeys((fit_split, evaluation_split)):
         split_dir = output_dir / split
         feature_path = split_dir / "utterance_features.csv"
         representation_path = split_dir / "representations.npz"
@@ -1094,8 +1102,10 @@ def koopman(args: argparse.Namespace) -> None:
             np.load(representation_path),
         )
 
-    train_features, train_representations = split_data["train"]
-    test_features, test_representations = split_data["test"]
+    fit_features, fit_representations = split_data[fit_split]
+    test_features, test_representations = split_data[evaluation_split]
+    if fit_split == evaluation_split:
+        print("Warning: K is being fit and evaluated on the test split.")
     checkpoint = args.checkpoint or ARTIFACTS / args.profile / "final"
     device = torch.device("mps" if args.profile in ("smoke", "mac") else "cuda")
     unembedding = load_unembedding(checkpoint).to(device)
@@ -1108,25 +1118,25 @@ def koopman(args: argparse.Namespace) -> None:
     surprisal_bound_rows = []
 
     for layer in LAYERS:
-        train_source = train_representations[f"source_{layer}"].astype(np.float64)
+        fit_source = fit_representations[f"source_{layer}"].astype(np.float64)
         test_source = test_representations[f"source_{layer}"].astype(np.float64)
         for target_type in ("ground_truth", "predicted"):
-            train_target = train_representations[f"{target_type}_{layer}"].astype(np.float64)
+            fit_target = fit_representations[f"{target_type}_{layer}"].astype(np.float64)
             test_target = test_representations[f"{target_type}_{layer}"].astype(np.float64)
-            train_branch = train_features[
-                train_features["target_type"] == target_type
+            fit_branch = fit_features[
+                fit_features["target_type"] == target_type
             ].sort_values("pair_id")
             test_branch = test_features[
                 test_features["target_type"] == target_type
             ].sort_values("pair_id")
-            if len(train_branch) != len(train_source) or len(test_branch) != len(test_source):
+            if len(fit_branch) != len(fit_source) or len(test_branch) != len(test_source):
                 raise RuntimeError("Feature rows and representation rows do not align.")
 
-            train_matrix, feature_statistics = feature_matrix(train_branch)
+            fit_matrix, feature_statistics = feature_matrix(fit_branch)
             test_matrix, _ = feature_matrix(test_branch, feature_statistics)
             feature_names = feature_statistics["feature_names"]
             result = fit_koopman(
-                train_source, train_target, args.koopman_rank, args.ridge_alpha
+                fit_source, fit_target, args.koopman_rank, args.ridge_alpha
             )
             test_source_coordinates = (
                 (test_source - result["center"]) @ result["basis"] / result["scale"]
@@ -1296,8 +1306,9 @@ def koopman(args: argparse.Namespace) -> None:
                 scale=result["scale"],
                 eigenvalues=result["eigenvalues"],
                 eigenvectors=result["eigenvectors"],
-                train_raw_mode_activations=result["raw_activations"].astype(np.float32),
-                train_zscored_mode_activations=result["zscored_activations"].astype(np.float32),
+                fit_split=np.asarray(fit_split),
+                fit_raw_mode_activations=result["raw_activations"].astype(np.float32),
+                fit_zscored_mode_activations=result["zscored_activations"].astype(np.float32),
                 test_raw_mode_activations=test_raw_activations.astype(np.float32),
                 test_zscored_mode_activations=test_zscored_activations.astype(np.float32),
                 activation_means=result["activation_means"],
@@ -1310,7 +1321,7 @@ def koopman(args: argparse.Namespace) -> None:
             )
 
             coefficients = []
-            gram = train_matrix.T @ train_matrix
+            gram = fit_matrix.T @ fit_matrix
             regularized_gram = gram + args.ridge_alpha * np.eye(gram.shape[0])
             for mode in range(result["rank"]):
                 raw_activation = result["raw_activations"][:, mode]
@@ -1319,17 +1330,17 @@ def koopman(args: argparse.Namespace) -> None:
                 test_zscored_activation = test_zscored_activations[:, mode]
                 regression = np.linalg.solve(
                     regularized_gram,
-                    train_matrix.T @ zscored_activation,
+                    fit_matrix.T @ zscored_activation,
                 )
-                train_fitted = train_matrix @ regression
+                fit_fitted = fit_matrix @ regression
                 test_fitted = test_matrix @ regression
-                train_total = np.sum(zscored_activation**2)
+                fit_total = np.sum(zscored_activation**2)
                 test_mode_total = np.sum(
                     (test_zscored_activation - test_zscored_activation.mean()) ** 2
                 )
-                train_mode_r2 = (
-                    1.0 - np.sum((zscored_activation - train_fitted) ** 2) / train_total
-                    if train_total > 0
+                fit_mode_r2 = (
+                    1.0 - np.sum((zscored_activation - fit_fitted) ** 2) / fit_total
+                    if fit_total > 0
                     else np.nan
                 )
                 test_mode_r2 = (
@@ -1354,7 +1365,8 @@ def koopman(args: argparse.Namespace) -> None:
                         "eigenvalue_magnitude": abs(eigenvalue),
                         "raw_activation_mean": result["activation_means"][mode],
                         "raw_activation_std": result["activation_scales"][mode],
-                        "train_feature_regression_r2": train_mode_r2,
+                        "fit_split": fit_split,
+                        "fit_feature_regression_r2": fit_mode_r2,
                         "test_feature_regression_r2": test_mode_r2,
                         "test_feature_regression_rmse": test_mode_rmse,
                         "top_features": "; ".join(
@@ -1375,7 +1387,7 @@ def koopman(args: argparse.Namespace) -> None:
                     )
                 if mode < TOP_EIGENMODES:
                     for data_split, branch, raw_values, zscored_values in (
-                        ("train", train_branch, raw_activation, zscored_activation),
+                        (fit_split, fit_branch, raw_activation, zscored_activation),
                         ("test", test_branch, test_raw_activation, test_zscored_activation),
                     ):
                         for rank_index, row_index in enumerate(
@@ -1410,9 +1422,11 @@ def koopman(args: argparse.Namespace) -> None:
                 {
                     "layer": layer,
                     "target_type": target_type,
+                    "fit_split": fit_split,
+                    "evaluation_split": evaluation_split,
                     "koopman_rank": result["rank"],
-                    "train_transition_r2": result["r2"],
-                    "train_transition_rmse": result["rmse"],
+                    "fit_transition_r2": result["r2"],
+                    "fit_transition_rmse": result["rmse"],
                     "test_transition_r2": test_transition_r2,
                     "test_transition_rmse": test_transition_rmse,
                     "spectral_radius": result["spectral_radius"],
@@ -1501,8 +1515,8 @@ def koopman(args: argparse.Namespace) -> None:
         "operators": len(summary_rows),
         "layers": list(LAYERS),
         "targets": ["ground_truth", "predicted"],
-        "operator_fit_split": "train",
-        "operator_evaluation_split": "test",
+        "operator_fit_split": fit_split,
+        "operator_evaluation_split": evaluation_split,
         "lifting_function": "final-token hidden representation produced by each learned layer",
         "fit": (
             "full hidden-space ridge regression Y = X K"
@@ -1511,21 +1525,23 @@ def koopman(args: argparse.Namespace) -> None:
         ),
         "effective_dimension": "singular-value participation ratio of K",
         "mode_regressions": (
-            "all eigenmodes; fit on training z-scored activations and features, "
+            f"all eigenmodes; fit on {fit_split} z-scored activations and features, "
             "then evaluated on test data"
         ),
         "feature_normalization": (
-            "fit separately on ground_truth and predicted training utterances; "
-            "the corresponding training statistics transform test utterances"
+            f"fit separately on ground_truth and predicted {fit_split} utterances; "
+            f"the corresponding {fit_split} statistics transform test utterances"
         ),
-        "raw_values": "raw features in train/test utterance_features.csv; train/test raw "
-        "and z-scored mode activations in each koopman_state_*.npz",
+        "raw_values": (
+            f"raw features in {fit_split}/test utterance_features.csv; "
+            "fit/test raw and z-scored mode activations in each koopman_state_*.npz"
+        ),
         "heatmaps": (
             f"display the {TOP_EIGENMODES} eigenmodes with largest eigenvalue magnitude; "
             "coefficient heatmaps hide feature names containing coverage or missing"
         ),
         "saved_utterances": (
-            f"top {args.top_utterances} train and test utterances for the "
+            f"top {args.top_utterances} {fit_split} and test utterances for the "
             f"{TOP_EIGENMODES} eigenmodes with largest eigenvalue magnitude"
         ),
         "theory_test": (
@@ -1592,9 +1608,9 @@ def koopman(args: argparse.Namespace) -> None:
 
 
 def analyze(args: argparse.Namespace) -> None:
-    """Fit the analysis on training utterances and evaluate it on test utterances."""
+    """Prepare the fit/test splits, fit the analysis, and evaluate on test."""
     accuracy = {}
-    for split in ("train", "test"):
+    for split in dict.fromkeys((args.koopman_fit_split, "test")):
         args.analysis_split = split
         construct_pairs(args)
         annotate(args)

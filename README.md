@@ -124,11 +124,11 @@ post-training validation metric. The test split is never used for gradient
 updates: it reports baseline and fine-tuned loss, perplexity, and next-token
 accuracy in `artifacts/{profile}/results.json`.
 
-The post-training analysis has its own train/test separation. It extracts
-utterance transitions from both splits, fits the six Koopman operators and all
-feature-to-mode regressions on training transitions, then evaluates those fixed
-fits on test transitions. Model accuracy on the exact analyzed transitions is
-reported for both splits in `artifacts/{profile}/analysis/model_accuracy.json`.
+The post-training analysis defaults to fitting on validation transitions and
+evaluating the fixed operators and feature regressions on test transitions.
+This avoids the much larger WikiText-103 training split. Model accuracy on the
+exact analyzed transitions is reported for both splits in
+`artifacts/{profile}/analysis/model_accuracy.json`.
 
 ## Post-training analysis
 
@@ -138,10 +138,9 @@ Run the complete analysis on the saved Mac checkpoint:
 python main.py analyze --profile mac
 ```
 
-The default uses every valid overlapping source window from both the training
-and test splits, the complete hidden dimension, and ridge penalty `1e-3`.
-Nothing is sampled or rank-truncated. The full WikiText-103 training analysis is
-therefore much larger and slower than the former test-only analysis.
+The default uses every valid overlapping source window from the validation and
+test splits, the complete hidden dimension, and ridge penalty `1e-3`. Nothing
+is sampled or rank-truncated.
 For a deliberately reduced executable check:
 
 ```bash
@@ -151,12 +150,16 @@ python main.py analyze --profile mac --analysis-samples 32 --koopman-rank 8
 The stages can also be run separately:
 
 ```bash
-python main.py pairs --profile mac --analysis-split train
-python main.py annotate --profile mac --analysis-split train
+python main.py pairs --profile mac --analysis-split validation
+python main.py annotate --profile mac --analysis-split validation
 python main.py pairs --profile mac --analysis-split test
 python main.py annotate --profile mac --analysis-split test
 python main.py koopman --profile mac
 ```
+
+Use `--koopman-fit-split train` only when the full training analysis is
+deliberate. `--koopman-fit-split test` is also supported, but fitting and
+evaluating on the same test transitions produces in-sample metrics.
 
 `pairs` forms a 10-token source `x[t:t+10]`. Its ground-truth target is
 `x[t+1:t+11]`; its predicted target is `x[t+1:t+10]` plus the model's argmax
@@ -187,21 +190,21 @@ missingness indicators during regression, and are summarized in
 
 `koopman` fits six matrices: three layers crossed with ground-truth versus
 predicted transitions. By default, ridge regression estimates `Y = X K` from
-the training representations in the complete hidden space, producing six 896
+the validation representations in the complete hidden space, producing six 896
 by 896 matrices for Qwen2.5-0.5B and using all eigenmodes. Each fixed K is then
 scored on test representations with R² and RMSE. A rank-limited POD/SVD basis
 is used only when `--koopman-rank` is explicitly provided.
 
 Before the feature regressions, missing numeric ratings are median-filled and
-every feature column is z-scored separately for ground-truth training rows and
-predicted training rows. Thus the two transition types do not share imputation
+every feature column is z-scored separately for ground-truth validation rows and
+predicted validation rows. Thus the two transition types do not share imputation
 medians, means, or standard deviations. Test rows are transformed with the
-corresponding training statistics. For each Koopman operator and eigenmode,
-absolute training activations are z-scored across training utterances; those
+corresponding validation statistics. For each Koopman operator and eigenmode,
+absolute validation activations are z-scored across validation utterances; those
 same means and standard deviations transform test activations. Ridge regression
-uses training features to predict training activations for every eigenmode,
+uses validation features to predict validation activations for every eigenmode,
 then reports held-out test R² and RMSE. Raw features remain in each split's
-`utterance_features.csv`; train/test raw and z-scored mode activations and all
+`utterance_features.csv`; fit/test raw and z-scored mode activations and all
 normalization statistics are saved in each `koopman_state_*.npz`.
 
 Every eigenmode remains in the fit, regression CSV, coefficient CSV, and saved
@@ -210,9 +213,9 @@ coefficient heatmaps display the 20 eigenmodes with largest eigenvalue magnitude
 on the x-axis. The coefficient heatmap displays every feature on the y-axis except
 names containing `coverage` or `missing`; those variables remain in the
 regression and complete coefficient CSV. `eigenmode_utterances.csv` saves the
-top 10 training and test utterances by default (`--top-utterances` accepts
+top 10 validation and test utterances by default (`--top-utterances` accepts
 10–20) for each of the 20 eigenmodes with largest eigenvalue magnitude. The
-output includes every coefficient, train/test R², test RMSE, and eigenvalue—not
+output includes every coefficient, fit/test R², test RMSE, and eigenvalue—not
 only selected significant results.
 
 Effective dimension is reported three ways:
@@ -268,9 +271,9 @@ K's representation error approaches zero, so this remains an empirical test.
   `g_l(x) = h_l(x; W_l)`: the final-token hidden representation generated by
   layer `l` using its learned weights. This is the utterance-dependent quantity
   to which Koopman regression can be applied.
-- Feature-to-mode regressions are descriptive ridge regressions fit on training
-  utterances and evaluated on test utterances. They identify associations, not
-  causal effects or inferential significance.
+- Feature-to-mode regressions are descriptive ridge regressions fit on the
+  selected fit split and evaluated on test utterances. They identify
+  associations, not causal effects or inferential significance.
 - Both predictors and mode activations are z-scored, so coefficients are
   standardized and comparable across eigenmodes. Coverage and missingness are
   hidden only from plots, not excluded from the fitted regressions.
@@ -294,15 +297,15 @@ artifacts/
   {profile}/final/           Reload-tested final model
   {profile}/results.json     Baseline, validation, final, and delta metrics
   {profile}/analysis/
-    model_accuracy.json      Train/test accuracy on analyzed transitions
-    {train,test}/
+    model_accuracy.json      Fit/test accuracy on analyzed transitions
+    {validation,test}/       Default fit and evaluation split directories
       utterance_pairs.csv    True and predicted shifted pairs
       model_accuracy.json    Accuracy for this split
       utterance_features.csv One annotated utterance per row
       representations.npz    Nine hidden-state arrays for this split
     K_*.npy                  Six fitted Koopman matrices
-    koopman_summary.csv      Train/test K R² and RMSE
-    eigenmode_*.csv          All regressions/coefficients and top train/test utterances
+    koopman_summary.csv      Fit/test K R² and RMSE
+    eigenmode_*.csv          All regressions/coefficients and top fit/test utterances
     eigenmodes_*.png         Six spectrum/test-activation/coefficient plots
     effective_dimensions.png
     theory_bound_samples.csv Per-utterance last-layer bound values
@@ -329,7 +332,7 @@ artifacts/
 - `load_norare()` joins the selected English lexical variables by exact form.
 - `annotate()` builds the utterance-by-feature dataframe with spaCy and NoRaRe.
 - `feature_matrix()` fits or applies median filling and z-scoring statistics;
-  `koopman()` fits them separately on ground-truth and predicted training rows.
+  `koopman()` fits them separately on ground-truth and predicted fit-split rows.
 - `load_unembedding()` loads only Qwen's saved output projection.
 - `largest_singular_value()` computes the unembedding spectral norm.
 - `softmax_bound_metrics()` computes cross-entropy, KL, and both bounds.
